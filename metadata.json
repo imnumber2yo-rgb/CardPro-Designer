@@ -1,0 +1,6 @@
+{
+  "name": "CardPro Designer & Imposition",
+  "description": "High-precision card design and professional print layout tool with imposition engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
