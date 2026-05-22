@@ -26,7 +26,9 @@ import {
   FileText,
   Copy,
   Eye,
-  Grid
+  Grid,
+  Lock,
+  Unlock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -82,6 +84,7 @@ type TextLayer = {
   shadowOffsetY: number;
   opacity: number;
   panel?: 'all' | 'front' | 'back';
+  locked?: boolean;
 };
 
 type ImageLayer = {
@@ -105,6 +108,7 @@ type ImageLayer = {
   };
   blendMode: BlendingMode;
   panel?: 'all' | 'front' | 'back';
+  locked?: boolean;
 };
 
 type Template = {
@@ -115,6 +119,88 @@ type Template = {
   isPortrait: boolean;
   imageLayers: ImageLayer[];
   textLayers: TextLayer[];
+};
+
+// --- Web Canvas Trim Utility to Ignore Whitespace ---
+const trimImageWhitespace = (src: string): Promise<string> => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(src);
+        return;
+      }
+      ctx.drawImage(img, 0, 0);
+      try {
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const { data, width, height } = imageData;
+        
+        let minX = width;
+        let minY = height;
+        let maxX = 0;
+        let maxY = 0;
+        
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const index = (y * width + x) * 4;
+            const r = data[index];
+            const g = data[index + 1];
+            const b = data[index + 2];
+            const a = data[index + 3];
+            
+            // Non-empty pixel if it is not alpha-transparent and not near-pure white
+            const isWhite = r > 240 && g > 240 && b > 240;
+            const isTransparent = a < 15;
+            
+            if (!isWhite && !isTransparent) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+        
+        if (maxX < minX || maxY < minY) {
+          resolve(src);
+          return;
+        }
+        
+        // Add safety border margin
+        minX = Math.max(0, minX - 2);
+        minY = Math.max(0, minY - 2);
+        maxX = Math.min(width - 1, maxX + 2);
+        maxY = Math.min(height - 1, maxY + 2);
+        
+        const cropWidth = maxX - minX + 1;
+        const cropHeight = maxY - minY + 1;
+        
+        const cropCanvas = document.createElement('canvas');
+        cropCanvas.width = cropWidth;
+        cropCanvas.height = cropHeight;
+        const cropCtx = cropCanvas.getContext('2d');
+        if (!cropCtx) {
+          resolve(src);
+          return;
+        }
+        
+        cropCtx.drawImage(canvas, minX, minY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+        resolve(cropCanvas.toDataURL('image/png'));
+      } catch (err) {
+        console.error("Trim whitespace error:", err);
+        resolve(src);
+      }
+    };
+    img.onerror = () => {
+      resolve(src);
+    };
+    img.src = src;
+  });
 };
 
 // --- App Component ---
@@ -158,6 +244,7 @@ export default function App() {
   const [pdfFile, setPdfFile] = useState<{ data: Uint8Array, name: string } | null>(null);
   const [pdfPages, setPdfPages] = useState<string[]>([]);
   const [isPdfLoading, setIsPdfLoading] = useState(false);
+  const [selectedCoverPanel, setSelectedCoverPanel] = useState<'all' | 'front' | 'back'>('front');
 
   // Initialize PDF worker
   useEffect(() => {
@@ -199,31 +286,34 @@ export default function App() {
   };
 
   const selectPdfPage = (src: string) => {
-    const newLayer: ImageLayer = {
-      id: `img_${Date.now()}`,
-      type: 'image',
-      src,
-      x: 0,
-      y: 0,
-      scale: 1,
-      rotation: 0,
-      fit: 'fill',
-      opacity: 100,
-      filters: {
-        brightness: 100,
-        contrast: 100,
-        saturation: 100,
-        grayscale: 0,
-        invert: 0,
-        hueRotate: 0,
-        blur: 0,
-      },
-      blendMode: 'normal',
-    };
-    setImageLayers([newLayer, ...imageLayers]);
-    setSelectedLayerId(newLayer.id);
-    setPdfFile(null);
-    setPdfPages([]);
+    trimImageWhitespace(src).then((trimmedSrc) => {
+      const newLayer: ImageLayer = {
+        id: `img_${Date.now()}`,
+        type: 'image',
+        src: trimmedSrc,
+        x: 0,
+        y: 0,
+        scale: 1,
+        rotation: 0,
+        fit: 'fill',
+        opacity: 100,
+        filters: {
+          brightness: 100,
+          contrast: 100,
+          saturation: 100,
+          grayscale: 0,
+          invert: 0,
+          hueRotate: 0,
+          blur: 0,
+        },
+        blendMode: 'normal',
+        panel: cardSize === 'Greeting Card' ? selectedCoverPanel : undefined,
+      };
+      setImageLayers([newLayer, ...imageLayers]);
+      setSelectedLayerId(newLayer.id);
+      setPdfFile(null);
+      setPdfPages([]);
+    });
   };
 
   // Load Templates
@@ -310,6 +400,7 @@ export default function App() {
     e.preventDefault();
     e.stopPropagation();
     setSelectedLayerId(layer.id);
+    if (layer.locked) return;
     
     setDragInfo({
       id: layer.id,
@@ -380,29 +471,33 @@ export default function App() {
     if (file) {
       const reader = new FileReader();
       reader.onload = (event) => {
-        const newLayer: ImageLayer = {
-          id: `img_${Date.now()}`,
-          type: 'image',
-          src: event.target?.result as string,
-          x: 0,
-          y: 0,
-          scale: 1,
-          rotation: 0,
-          fit: 'fill',
-          opacity: 100,
-          filters: {
-            brightness: 100,
-            contrast: 100,
-            saturation: 100,
-            grayscale: 0,
-            invert: 0,
-            hueRotate: 0,
-            blur: 0,
-          },
-          blendMode: 'normal',
-        };
-        setImageLayers([newLayer, ...imageLayers]);
-        setSelectedLayerId(newLayer.id);
+        const originalSrc = event.target?.result as string;
+        trimImageWhitespace(originalSrc).then((trimmedSrc) => {
+          const newLayer: ImageLayer = {
+            id: `img_${Date.now()}`,
+            type: 'image',
+            src: trimmedSrc,
+            x: 0,
+            y: 0,
+            scale: 1,
+            rotation: 0,
+            fit: 'fill',
+            opacity: 100,
+            filters: {
+              brightness: 100,
+              contrast: 100,
+              saturation: 100,
+              grayscale: 0,
+              invert: 0,
+              hueRotate: 0,
+              blur: 0,
+            },
+            blendMode: 'normal',
+            panel: cardSize === 'Greeting Card' ? selectedCoverPanel : undefined,
+          };
+          setImageLayers([newLayer, ...imageLayers]);
+          setSelectedLayerId(newLayer.id);
+        });
       };
       reader.readAsDataURL(file);
     }
@@ -520,17 +615,24 @@ export default function App() {
   // --- Components ---
 
   const CardPreview = ({ scale = 1, isPrint = false }: { scale?: number, isPrint?: boolean }) => {
+    const hasSelectedImage = !isPrint && selectedLayerId && imageLayers.some(l => l.id === selectedLayerId);
+
     return (
       <div 
         id={isPrint ? undefined : "card-surface"}
-        className="relative shadow-2xl overflow-hidden bg-white"
+        className={`relative shadow-2xl bg-white ${hasSelectedImage ? 'overflow-visible' : 'overflow-hidden'}`}
         style={{
           width: `${cardWidthIn * DPI * scale}px`,
           height: `${cardHeightIn * DPI * scale}px`,
           transform: `scale(1)`,
           transformOrigin: 'top left',
+          overflow: hasSelectedImage ? 'visible' : 'hidden',
         }}
       >
+        {/* Frame boundary highlight shown when scaling images outside the page */}
+        {hasSelectedImage && (
+          <div className="absolute inset-0 pointer-events-none border-2 border-dashed border-orange-500/50 z-50" />
+        )}
         {/* Fold Indicator & Surface Labels for Greeting Cards */}
         {cardSize === 'Greeting Card' && !isPrint && (
           <div className="absolute inset-0 pointer-events-none flex z-50">
@@ -596,7 +698,7 @@ export default function App() {
                 top: panelTop,
                 width: panelWidth,
                 height: panelHeight,
-                overflow: (isDivided && layer.panel && layer.panel !== 'all') ? 'hidden' : 'visible',
+                overflow: (isDivided && layer.panel && layer.panel !== 'all' && !isSelected) ? 'hidden' : 'visible',
               }}
             >
               <div 
@@ -610,7 +712,7 @@ export default function App() {
                   src={layer.src} 
                   alt=""
                   onMouseDown={(e) => !isPrint && startDrag(e, layer, 'move')}
-                  className="absolute cursor-move origin-center"
+                  className={`absolute origin-center ${layer.locked ? 'cursor-not-allowed' : 'cursor-move'}`}
                   style={{
                     top: `${layer.y}%`,
                     left: `${layer.x}%`,
@@ -630,7 +732,7 @@ export default function App() {
                   }}
                 />
 
-                {isSelected && (
+                {isSelected && !layer.locked && (
                   <div 
                     className="absolute inset-0 pointer-events-none z-[1001]"
                     style={{
@@ -717,13 +819,13 @@ export default function App() {
                 opacity: layer.opacity / 100,
                 WebkitTextStroke: `${layer.strokeWidth}px ${layer.strokeColor}`,
                 textShadow: `${layer.shadowOffsetX}px ${layer.shadowOffsetY}px ${layer.shadowBlur}px ${layer.shadowColor}`,
-                cursor: isPrint ? 'default' : 'move',
+                cursor: isPrint ? 'default' : (layer.locked ? 'not-allowed' : 'move'),
               }}
               onMouseDown={(e) => !isPrint && startDrag(e, layer, 'move')}
             >
               {layer.content}
 
-              {isSelected && (
+              {isSelected && !layer.locked && (
                 <>
                   {/* Rotation handle floating above top */}
                   <button
@@ -844,18 +946,18 @@ export default function App() {
 
   if (isPrintPreview) {
     return (
-      <div className="min-h-screen bg-[#0a0a0a] flex flex-col">
-        <div className="h-16 bg-[#1a1a1a] border-b border-[#2a2a2a] flex items-center justify-between px-8 no-print">
+      <div className="min-h-screen bg-[#efe5d5] flex flex-col font-sans text-stone-900">
+        <div className="h-16 bg-[#faf7f0] border-b border-stone-200 flex items-center justify-between px-8 no-print shadow-xs">
           <div className="flex items-center gap-4">
-            <button onClick={() => setIsPrintPreview(false)} className="p-2 hover:bg-[#2a2a2a] rounded-lg transition-colors">
-              <X className="w-5 h-5 text-gray-400" />
+            <button onClick={() => setIsPrintPreview(false)} className="p-2 hover:bg-stone-100 rounded-lg transition-colors">
+              <X className="w-5 h-5 text-stone-600" />
             </button>
-            <h1 className="text-white font-medium">Print Production Layout</h1>
+            <h1 className="text-stone-900 font-bold tracking-tight">Print Production Layout</h1>
           </div>
           <div className="flex items-center gap-4">
              <button 
               onClick={() => window.print()}
-              className="flex items-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-6 py-2 rounded-lg font-medium transition-colors"
+              className="flex items-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-6 py-2 rounded-lg font-medium transition-colors shadow-sm"
             >
               <Printer className="w-4 h-4" />
               Print Production Sheet
@@ -863,7 +965,7 @@ export default function App() {
           </div>
         </div>
         
-        <div className="flex-1 p-12 overflow-auto bg-[#0a0a0a] flex justify-center no-print">
+        <div className="flex-1 p-12 overflow-auto bg-[#eaddce] flex justify-center no-print">
           <PrintLayout />
         </div>
 
@@ -912,23 +1014,23 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen bg-[#050505] text-gray-300 font-sans selection:bg-orange-500/30">
+    <div className="flex h-screen bg-[#efe5d5] text-stone-700 font-sans selection:bg-orange-500/30">
       
       {/* --- Left Panes: File Ingestion & Layers --- */}
-      <div className="w-80 h-full border-r border-white/10 flex flex-col bg-[#0a0a0b]">
-        <div className="p-4 border-b border-white/10 flex items-center gap-3">
-          <div className="w-8 h-8 rounded bg-orange-600 flex items-center justify-center">
+      <div className="w-80 h-full border-r border-stone-200 flex flex-col bg-[#faf7f0]">
+        <div className="p-4 border-b border-stone-200 flex items-center gap-3">
+          <div className="w-8 h-8 rounded bg-orange-600 flex items-center justify-center shadow-xs">
             <Maximize className="w-5 h-5 text-white" />
           </div>
           <input 
             value={templateName}
             onChange={(e) => setTemplateName(e.target.value)}
-            className="bg-transparent border-none focus:ring-0 text-white font-medium p-0 text-sm"
+            className="bg-transparent border-none focus:ring-0 text-stone-900 font-bold p-0 text-sm"
           />
         </div>
 
         {/* Tab Navigation */}
-        <div className="flex border-b border-white/5 p-1 bg-[#050505] mx-4 my-2 rounded-lg">
+        <div className="flex border border-stone-200/60 p-1 bg-stone-200/50 mx-4 my-2 rounded-lg">
           {[
             { id: 'assets', icon: Upload },
             { id: 'layers', icon: Layers },
@@ -937,11 +1039,11 @@ export default function App() {
             { id: 'print', icon: Grid },
           ].map((tab) => (
             <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id as any)}
-              className={`flex-1 flex justify-center py-2 rounded-md transition-all ${
-                activeTab === tab.id ? 'bg-[#1a1a1c] text-orange-500 shadow-sm' : 'text-gray-500 hover:text-gray-300'
-              }`}
+               key={tab.id}
+               onClick={() => setActiveTab(tab.id as any)}
+               className={`flex-1 flex justify-center py-2 rounded-md transition-all ${
+                 activeTab === tab.id ? 'bg-white text-orange-600 shadow-sm border border-stone-200/30' : 'text-stone-400 hover:text-stone-700'
+               }`}
             >
               <tab.icon className="w-4 h-4" />
             </button>
@@ -953,36 +1055,62 @@ export default function App() {
             {activeTab === 'assets' && (
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-6 pt-2">
                 <div>
-                  <label className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold mb-2 block">Upload Asset</label>
+                  <label className="text-[10px] uppercase tracking-wider text-stone-500 font-semibold mb-2 block">Upload Asset</label>
                   <div className="grid grid-cols-2 gap-2">
-                    <label className="flex flex-col items-center justify-center p-4 border border-dashed border-white/10 rounded-xl hover:bg-white/5 cursor-pointer transition-all group">
-                      <ImageIcon className="w-5 h-5 text-gray-400 group-hover:text-orange-500 mb-1" />
-                      <span className="text-[10px] text-gray-500">Image</span>
+                    <label className="flex flex-col items-center justify-center p-4 border border-dashed border-stone-300 rounded-xl hover:bg-stone-200/40 cursor-pointer transition-all group">
+                      <ImageIcon className="w-5 h-5 text-stone-500 group-hover:text-orange-500 mb-1" />
+                      <span className="text-[10px] text-stone-600 font-medium">Image</span>
                       <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                     </label>
-                    <label className="flex flex-col items-center justify-center p-4 border border-dashed border-white/10 rounded-xl hover:bg-white/5 cursor-pointer transition-all group">
-                      <FileText className="w-5 h-5 text-gray-400 group-hover:text-orange-500 mb-1" />
-                      <span className="text-[10px] text-gray-500">PDF</span>
+                    <label className="flex flex-col items-center justify-center p-4 border border-dashed border-stone-300 rounded-xl hover:bg-stone-200/40 cursor-pointer transition-all group">
+                      <FileText className="w-5 h-5 text-stone-500 group-hover:text-orange-500 mb-1" />
+                      <span className="text-[10px] text-stone-600 font-medium">PDF</span>
                       <input type="file" className="hidden" accept="application/pdf" onChange={handlePdfUpload} />
                     </label>
                   </div>
                 </div>
 
+                {cardSize === 'Greeting Card' && (
+                  <div className="bg-stone-100/60 p-3 rounded-xl border border-stone-200/80 space-y-2 animate-in fade-in duration-200">
+                    <label className="text-[9px] uppercase tracking-wider text-stone-500 font-bold block">Target Cover Allocation</label>
+                    <div className="flex gap-1.5 p-1 bg-white rounded-lg border border-stone-200">
+                      {[
+                        { key: 'all', label: 'Full Spread' },
+                        { key: 'front', label: 'Front' },
+                        { key: 'back', label: 'Back' }
+                      ].map(opt => (
+                        <button
+                          key={opt.key}
+                          onClick={() => setSelectedCoverPanel(opt.key as any)}
+                          className={`flex-1 py-1 text-[9px] uppercase font-bold rounded transition-colors ${
+                            selectedCoverPanel === opt.key ? 'bg-orange-600 text-white' : 'text-stone-500 hover:text-stone-800'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="text-[8.5px] text-stone-500 font-medium leading-relaxed">
+                      Newly added image assets will automatically fit and fill the chosen cover canvas section specified here.
+                    </p>
+                  </div>
+                )}
+
                 {isPdfLoading && (
-                  <div className="flex items-center gap-2 p-3 bg-orange-500/10 rounded-lg text-orange-500 text-xs">
+                  <div className="flex items-center gap-2 p-3 bg-orange-500/10 rounded-lg text-orange-600 text-xs border border-orange-500/20">
                     <RotateCw className="w-3 h-3 animate-spin" /> Analyzing PDF document...
                   </div>
                 )}
 
                 <div>
-                   <label className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold mb-3 block">Card Geometry</label>
+                   <label className="text-[10px] uppercase tracking-wider text-stone-500 font-semibold mb-3 block">Card Geometry</label>
                    <div className="grid grid-cols-1 gap-2">
                     {Object.keys(CARD_PRESETS).map(preset => (
                       <button
                         key={preset}
                         onClick={() => setCardSize(preset)}
                         className={`text-left px-3 py-2 rounded-lg text-xs border transition-all ${
-                          cardSize === preset ? 'border-orange-500/50 bg-orange-500/10 text-orange-500' : 'border-white/5 bg-white/5 hover:border-white/20'
+                          cardSize === preset ? 'border-orange-500/50 bg-orange-500/10 text-orange-600 font-semibold' : 'border-stone-200 bg-white text-stone-700 hover:border-stone-400'
                         }`}
                       >
                         <div className="font-medium">{preset}</div>
@@ -992,26 +1120,26 @@ export default function App() {
                    </div>
                 </div>
 
-                <div className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
-                   <div className="text-xs flex items-center gap-2">
-                      <Move className="w-3 h-3" /> Orientation
+                <div className="flex items-center justify-between p-3 bg-white rounded-xl border border-stone-200">
+                   <div className="text-xs flex items-center gap-2 text-stone-700 font-medium">
+                      <Move className="w-3 h-3 text-stone-500" /> Orientation
                    </div>
                    <button 
                     onClick={() => setIsPortrait(!isPortrait)}
                     className={`px-3 py-1 rounded text-[10px] uppercase font-bold transition-all ${
-                      isPortrait ? 'bg-orange-600 text-white' : 'bg-[#1a1a1c] text-gray-400'
+                      isPortrait ? 'bg-orange-600 text-white' : 'bg-stone-200 text-stone-700 hover:bg-stone-300'
                     }`}
                    >
                      {isPortrait ? 'Portrait' : 'Landscape'}
                    </button>
                 </div>
 
-                <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl space-y-1.5 text-left">
-                   <div className="flex items-center gap-2 text-blue-400">
+                <div className="p-3 bg-stone-100 border border-stone-200 rounded-xl space-y-1.5 text-left">
+                   <div className="flex items-center gap-2 text-stone-700">
                       <ImageIcon className="w-3.5 h-3.5" />
                       <span className="text-[10px] font-bold uppercase tracking-wider">Print Orientation Suggestion</span>
                    </div>
-                   <div className="text-[10px] text-gray-400 leading-relaxed font-sans font-medium">
+                   <div className="text-[10px] text-stone-600 leading-relaxed font-sans font-medium">
                      {cardSize === 'Business Card' && (
                        <span>
                          <strong>Standard Layout:</strong> Use <strong>Landscape</strong> for front containing core logo/contact details, and a high contrast solid back page. Avoid vertical text on horizontal layouts to prevent printing orientation mismatch.
@@ -1038,30 +1166,30 @@ export default function App() {
                 </div>
 
                 {cardSize === 'Greeting Card' && (
-                  <motion.div initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} className="space-y-4 pt-4 border-t border-white/5">
+                  <motion.div initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} className="space-y-4 pt-4 border-t border-stone-200">
                      <div>
-                       <label className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold mb-2 block">Fold Configuration</label>
-                       <div className="flex p-1 bg-black/20 rounded-lg border border-white/5">
+                       <label className="text-[10px] uppercase tracking-wider text-stone-500 font-semibold mb-2 block">Fold Configuration</label>
+                       <div className="flex p-1 bg-stone-200/50 rounded-lg border border-stone-200">
                           <button 
                             onClick={() => setFoldType('side')}
-                            className={`flex-1 py-1.5 text-[10px] uppercase font-bold rounded transition-all ${foldType === 'side' ? 'bg-white/10 text-white' : 'text-gray-500'}`}
+                            className={`flex-1 py-1.5 text-[10px] uppercase font-bold rounded transition-all ${foldType === 'side' ? 'bg-white text-stone-900 border border-stone-200 shadow-xs' : 'text-stone-500 hover:text-stone-800'}`}
                           >
                             Side Flip
                           </button>
                           <button 
                             onClick={() => setFoldType('top')}
-                            className={`flex-1 py-1.5 text-[10px] uppercase font-bold rounded transition-all ${foldType === 'top' ? 'bg-white/10 text-white' : 'text-gray-500'}`}
+                            className={`flex-1 py-1.5 text-[10px] uppercase font-bold rounded transition-all ${foldType === 'top' ? 'bg-white text-stone-900 border border-stone-200 shadow-xs' : 'text-stone-500 hover:text-stone-800'}`}
                           >
                             Top Flip
                           </button>
                        </div>
                      </div>
-                     <div className="p-3 bg-orange-600/10 border border-orange-500/20 rounded-xl">
-                        <div className="flex items-center gap-2 text-orange-500 mb-1">
+                     <div className="p-3 bg-orange-500/5 border border-orange-500/25 rounded-xl">
+                        <div className="flex items-center gap-2 text-orange-600 mb-1">
                            <ImageIcon className="w-3 h-3" />
                            <span className="text-[10px] font-bold uppercase">Orientation Guide</span>
                         </div>
-                        <p className="text-[9px] text-gray-400 leading-relaxed">
+                        <p className="text-[9px] text-stone-600 leading-relaxed font-semibold">
                           {foldType === 'side' 
                             ? "For side-fold cards: The Front Cover is on the RIGHT side. The Back Cover is on the LEFT." 
                             : "For top-fold cards: The Front Cover is on the BOTTOM side. Rotate your Back Cover assets 180° on the TOP half."}
@@ -1074,33 +1202,48 @@ export default function App() {
 
             {activeTab === 'layers' && (
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-3 pt-2">
-                 <label className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold block">Layers Hierarchy</label>
+                 <label className="text-[10px] uppercase tracking-wider text-stone-500 font-semibold block">Layers Hierarchy</label>
                  <div className="space-y-2">
                   {[...textLayers, ...imageLayers].map((layer) => (
                     <div 
                       key={layer.id}
                       onClick={() => setSelectedLayerId(layer.id)}
                       className={`group flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
-                        selectedLayerId === layer.id ? 'bg-orange-500/10 border-orange-500/50 text-white' : 'bg-white/5 border-white/5 hover:border-white/20'
+                        selectedLayerId === layer.id ? 'bg-orange-50 border-orange-500/50 text-stone-900 font-semibold' : 'bg-white border-stone-200 text-stone-800 hover:border-stone-400 shadow-xs'
                       }`}
                     >
-                      <div className="p-1.5 rounded bg-black/40 text-gray-400">
+                      <div className="p-1.5 rounded bg-stone-100 text-stone-600">
                         {layer.type === 'image' ? <ImageIcon className="w-3.5 h-3.5" /> : <Type className="w-3.5 h-3.5" />}
                       </div>
                       <div className="flex-1 min-w-0">
-                        <div className="text-[11px] font-medium truncate">
+                        <div className="text-[11px] font-medium truncate flex items-center gap-1.5">
                           {layer.type === 'text' ? (layer as TextLayer).content : `Image Asset #${layer.id.slice(-4)}`}
+                          {layer.locked && <Lock className="w-3 h-3 text-orange-600 shrink-0" />}
                         </div>
-                        <div className="text-[9px] text-gray-500 uppercase">{layer.type}</div>
+                        <div className="text-[9px] text-stone-400 font-medium uppercase">{layer.type}</div>
                       </div>
-                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'up'); }} className="p-1 hover:text-white"><ChevronRight className="w-3 h-3 -rotate-90" /></button>
-                        <button onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }} className="p-1 hover:text-red-500"><Trash2 className="w-3 h-3" /></button>
+                      <div className={`flex items-center gap-1 transition-opacity ${layer.locked ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+                        <button 
+                          title={layer.locked ? "Unlock Layer" : "Lock Layer"}
+                          onClick={(e) => { 
+                            e.stopPropagation(); 
+                            if (layer.type === 'image') {
+                              updateImageLayer(layer.id, { locked: !layer.locked });
+                            } else {
+                              updateTextLayer(layer.id, { locked: !layer.locked });
+                            }
+                          }} 
+                          className={`p-1 transition-colors ${layer.locked ? 'text-orange-600 hover:text-orange-700' : 'text-stone-400 hover:text-stone-800'}`}
+                        >
+                          {layer.locked ? <Lock className="w-3.5 h-3.5" /> : <Unlock className="w-3.5 h-3.5" />}
+                        </button>
+                        <button onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 'up'); }} className="p-1 hover:text-stone-900 text-stone-400"><ChevronRight className="w-3 h-3 -rotate-90" /></button>
+                        <button onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }} className="p-1 hover:text-red-500 text-stone-400"><Trash2 className="w-3 h-3" /></button>
                       </div>
                     </div>
                   ))}
                   {(textLayers.length + imageLayers.length) === 0 && (
-                    <div className="py-8 text-center text-gray-600 text-xs">No layers yet</div>
+                    <div className="py-8 text-center text-stone-400 text-xs font-semibold">No layers yet</div>
                   )}
                  </div>
               </motion.div>
@@ -1118,29 +1261,29 @@ export default function App() {
                  {selectedLayer?.type === 'text' && (
                    <div className="space-y-5 animate-in fade-in slide-in-from-top-2">
                      <div>
-                       <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Content</label>
+                       <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Content</label>
                        <textarea 
                         value={(selectedLayer as TextLayer).content}
                         onChange={(e) => updateTextLayer(selectedLayer.id, { content: e.target.value })}
-                        className="w-full bg-white/5 border border-white/10 rounded-lg p-3 text-xs text-white focus:ring-1 focus:ring-orange-500 outline-none h-20"
+                        className="w-full bg-white border border-stone-200 rounded-lg p-3 text-xs text-stone-900 focus:ring-1 focus:ring-orange-500 outline-none h-20 shadow-xs"
                        />
                      </div>
                      <div className="grid grid-cols-2 gap-4">
                         <div>
-                          <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Font Size</label>
+                          <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Font Size</label>
                           <input 
                             type="number" 
                             value={(selectedLayer as TextLayer).fontSize}
                             onChange={(e) => updateTextLayer(selectedLayer.id, { fontSize: Number(e.target.value) })}
-                            className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white focus:ring-1 focus:ring-orange-500 outline-none"
+                            className="w-full bg-white border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-900 focus:ring-1 focus:ring-orange-500 outline-none shadow-xs"
                           />
                         </div>
                         <div>
-                          <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Weight</label>
+                          <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Weight</label>
                           <select 
                             value={(selectedLayer as TextLayer).fontWeight}
                             onChange={(e) => updateTextLayer(selectedLayer.id, { fontWeight: e.target.value })}
-                            className="w-full bg-[#1a1a1c] border border-white/10 rounded-lg px-1 py-1.5 text-xs text-white outline-none"
+                            className="w-full bg-white border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-900 outline-none shadow-xs"
                           >
                             <option value="300">Light</option>
                             <option value="400">Regular</option>
@@ -1150,7 +1293,7 @@ export default function App() {
                         </div>
                      </div>
                      <div>
-                        <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Color</label>
+                        <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Color</label>
                         <div className="flex gap-2">
                           <input 
                             type="color" 
@@ -1162,7 +1305,7 @@ export default function App() {
                             type="text" 
                             value={(selectedLayer as TextLayer).color}
                             onChange={(e) => updateTextLayer(selectedLayer.id, { color: e.target.value })}
-                            className="flex-1 bg-white/5 border border-white/10 rounded-lg px-2 text-xs text-white outline-none uppercase"
+                            className="flex-1 bg-white border border-stone-200 rounded-lg px-2 text-xs text-stone-900 outline-none uppercase shadow-xs"
                           />
                         </div>
                      </div>
@@ -1177,13 +1320,13 @@ export default function App() {
                    <div className="space-y-4">
                      <div>
                         <div className="flex justify-between mb-2">
-                          <label className="text-[10px] text-gray-500 uppercase font-bold">Blending Mode</label>
-                          <span className="text-[10px] text-gray-400 capitalize">{(selectedLayer as ImageLayer).blendMode}</span>
+                          <label className="text-[10px] text-stone-500 uppercase font-bold">Blending Mode</label>
+                          <span className="text-[10px] text-stone-500 font-medium capitalize">{(selectedLayer as ImageLayer).blendMode}</span>
                         </div>
                         <select 
                           value={(selectedLayer as ImageLayer).blendMode}
                           onChange={(e) => updateImageLayer(selectedLayer.id, { blendMode: e.target.value as any })}
-                          className="w-full bg-[#1a1a1c] border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white outline-none"
+                          className="w-full bg-white border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-900 outline-none shadow-xs"
                         >
                           <option value="normal">Normal</option>
                           <option value="multiply">Multiply</option>
@@ -1205,8 +1348,8 @@ export default function App() {
                      ].map((filter) => (
                        <div key={filter.key}>
                          <div className="flex justify-between mb-1.5">
-                           <label className="text-[10px] text-gray-500 uppercase font-bold">{filter.label}</label>
-                           <span className="text-[10px] text-gray-400 font-mono">{(selectedLayer as ImageLayer).filters[filter.key as keyof ImageLayer['filters']]}{filter.unit}</span>
+                           <label className="text-[10px] text-stone-500 uppercase font-bold">{filter.label}</label>
+                           <span className="text-[10px] text-stone-500 font-mono font-medium">{(selectedLayer as ImageLayer).filters[filter.key as keyof ImageLayer['filters']]}{filter.unit}</span>
                          </div>
                          <input 
                           type="range"
@@ -1329,7 +1472,7 @@ export default function App() {
       </div>
 
       {/* --- Center Pane: Design Canvas --- */}
-      <div className="flex-1 h-full flex flex-col items-center justify-center p-8 bg-[#050505] relative overflow-hidden">
+      <div className="flex-1 h-full flex flex-col items-center justify-center p-8 bg-[#77c9ee] relative overflow-hidden">
         {/* Dynamic Canvas Background */}
         <div className="absolute inset-0 overflow-hidden pointer-events-none opacity-20">
            <div className="absolute top-0 left-0 w-full h-full" style={{ backgroundImage: 'radial-gradient(#222 1px, transparent 1px)', backgroundSize: '24px 24px' }} />
@@ -1352,7 +1495,7 @@ export default function App() {
 
           <div className="relative group perspective-1000">
              <div className="absolute -inset-1 border border-orange-500/20 rounded-lg blur-xl opacity-0 group-hover:opacity-10 dark:opacity-20 transition-opacity" />
-             <div className="relative border border-white/10 rounded-lg shadow-2xl p-4 bg-[#111] backdrop-blur-xl">
+             <div className="relative border border-white/10 rounded-lg shadow-2xl p-4 bg-[#ddf373] backdrop-blur-xl">
                <CardPreview scale={1} />
              </div>
           </div>
@@ -1427,11 +1570,11 @@ export default function App() {
       </div>
 
       {/* --- Right Pane: Template Mgmt & Layer Details --- */}
-      <div className="w-80 h-full border-l border-white/10 flex flex-col bg-[#0a0a0b]">
+      <div className="w-80 h-full border-l border-stone-200 flex flex-col bg-[#faf7f0]">
         {selectedLayer ? (
           <div className="flex-1 flex flex-col h-full">
-            <div className="p-4 border-b border-white/10 flex items-center justify-between">
-              <h2 className="text-xs font-bold uppercase tracking-widest text-gray-500">Transform Engine</h2>
+            <div className="p-4 border-b border-stone-200 flex items-center justify-between">
+              <h2 className="text-xs font-bold uppercase tracking-widest text-stone-500">Transform Engine</h2>
               <button 
                 onClick={() => setSelectedLayerId(null)}
                 className="text-gray-500 hover:text-white"
@@ -1445,34 +1588,34 @@ export default function App() {
               <div className="space-y-4">
                  <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Pos X (%)</label>
+                      <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Pos X (%)</label>
                       <input 
                         type="number" 
                         value={selectedLayer.x}
                         onChange={(e) => selectedLayer.type === 'image' ? updateImageLayer(selectedLayer.id, { x: Number(e.target.value) }) : updateTextLayer(selectedLayer.id, { x: Number(e.target.value) })}
-                        className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white outline-none"
+                        className="w-full bg-white border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-900 outline-none shadow-xs"
                       />
                     </div>
                     <div>
-                      <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Pos Y (%)</label>
+                      <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Pos Y (%)</label>
                       <input 
                         type="number" 
                         value={selectedLayer.y}
                         onChange={(e) => selectedLayer.type === 'image' ? updateImageLayer(selectedLayer.id, { y: Number(e.target.value) }) : updateTextLayer(selectedLayer.id, { y: Number(e.target.value) })}
-                        className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white outline-none"
+                        className="w-full bg-white border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-900 outline-none shadow-xs"
                       />
                     </div>
                  </div>
 
                  <div>
                     <div className="flex justify-between mb-1.5">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Rotation</label>
-                      <span className="text-[10px] text-gray-400 font-mono">{selectedLayer.rotation}°</span>
+                      <label className="text-[10px] text-stone-500 uppercase font-bold">Rotation</label>
+                      <span className="text-[10px] text-stone-500 font-semibold font-mono">{selectedLayer.rotation}°</span>
                     </div>
                     <input 
                       type="range" min="0" max="360" value={selectedLayer.rotation}
                       onChange={(e) => selectedLayer.type === 'image' ? updateImageLayer(selectedLayer.id, { rotation: Number(e.target.value) }) : updateTextLayer(selectedLayer.id, { rotation: Number(e.target.value) })}
-                      className="w-full accent-orange-500 h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                      className="w-full accent-orange-600 h-1 bg-stone-200 rounded-lg appearance-none cursor-pointer"
                     />
                  </div>
 
@@ -1480,24 +1623,24 @@ export default function App() {
                     <>
                       <div>
                         <div className="flex justify-between mb-1.5">
-                          <label className="text-[10px] text-gray-500 uppercase font-bold">Scaling</label>
-                          <span className="text-[10px] text-gray-400 font-mono">{(selectedLayer as ImageLayer).scale.toFixed(2)}x</span>
+                          <label className="text-[10px] text-stone-500 uppercase font-bold">Scaling</label>
+                          <span className="text-[10px] text-stone-500 font-semibold font-mono">{(selectedLayer as ImageLayer).scale.toFixed(2)}x</span>
                         </div>
                         <input 
                           type="range" min="0.1" max="5" step="0.1" value={(selectedLayer as ImageLayer).scale}
                           onChange={(e) => updateImageLayer(selectedLayer.id, { scale: Number(e.target.value), fit: 'custom' })}
-                          className="w-full accent-orange-500 h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                          className="w-full accent-orange-600 h-1 bg-stone-200 rounded-lg appearance-none cursor-pointer"
                         />
                       </div>
                       <div>
-                        <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Canvas Bounds</label>
-                        <div className="flex gap-2 p-1 bg-black/20 rounded-lg border border-white/5">
+                        <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Canvas Bounds</label>
+                        <div className="flex gap-1.5 p-1 bg-stone-200/50 rounded-lg border border-stone-200">
                            {['fit', 'fill', 'custom'].map(m => (
                              <button
                               key={m}
                               onClick={() => updateImageLayer(selectedLayer.id, { fit: m as any })}
                               className={`flex-1 py-1 text-[9px] uppercase font-bold rounded capitalize ${
-                                (selectedLayer as ImageLayer).fit === m ? 'bg-orange-600 text-white' : 'text-gray-500 hover:text-gray-400'
+                                (selectedLayer as ImageLayer).fit === m ? 'bg-white text-stone-900 border border-stone-200 shadow-xs' : 'text-stone-500 hover:text-stone-800'
                               }`}
                              >
                                {m}
@@ -1509,9 +1652,9 @@ export default function App() {
                  )}
 
                  {cardSize === 'Greeting Card' && (
-                    <div className="animate-in fade-in slide-in-from-top-2 p-3 bg-white/5 rounded-xl border border-white/5 space-y-2">
-                      <label className="text-[10px] text-gray-400 uppercase font-bold block">Cover Allocation (Divided Canvas)</label>
-                      <div className="flex gap-2 p-1 bg-black/20 rounded-lg border border-white/5">
+                    <div className="animate-in fade-in slide-in-from-top-2 p-3 bg-stone-200/40 rounded-xl border border-stone-200 space-y-2">
+                      <label className="text-[10px] text-stone-500 uppercase font-bold block">Cover Allocation (Divided Canvas)</label>
+                      <div className="flex gap-1.5 p-1 bg-stone-200/60 rounded-lg border border-stone-200/50">
                         {[
                           { key: 'all', label: 'Full Spread' },
                           { key: 'front', label: 'Front Cover' },
@@ -1523,14 +1666,14 @@ export default function App() {
                               ? updateImageLayer(selectedLayer.id, { panel: opt.key as any }) 
                               : updateTextLayer(selectedLayer.id, { panel: opt.key as any })}
                             className={`flex-1 py-1 text-[9px] uppercase font-bold rounded ${
-                              (selectedLayer.panel || 'all') === opt.key ? 'bg-orange-600 text-white' : 'text-gray-500 hover:text-gray-400'
+                              (selectedLayer.panel || 'all') === opt.key ? 'bg-white text-stone-900 border border-stone-200/50 shadow-xs' : 'text-stone-500 hover:text-stone-800'
                             }`}
                           >
                             {opt.label}
                           </button>
                         ))}
                       </div>
-                      <p className="text-[9px] text-gray-400 leading-relaxed font-sans font-medium">
+                      <p className="text-[9px] text-stone-600 leading-relaxed font-sans font-medium">
                         Fit the layer securely inside a single side cover context. Back covers are rendered on the Left (Side fold) or Top (Top fold).
                       </p>
                     </div>
@@ -1538,23 +1681,23 @@ export default function App() {
 
                  <div>
                     <div className="flex justify-between mb-1.5">
-                      <label className="text-[10px] text-gray-500 uppercase font-bold">Opacity</label>
-                      <span className="text-[10px] text-gray-400 font-mono">{selectedLayer.opacity}%</span>
+                      <label className="text-[10px] text-stone-500 uppercase font-bold">Opacity</label>
+                      <span className="text-[10px] text-stone-500 font-semibold font-mono">{selectedLayer.opacity}%</span>
                     </div>
                     <input 
                       type="range" min="0" max="100" value={selectedLayer.opacity}
                       onChange={(e) => selectedLayer.type === 'image' ? updateImageLayer(selectedLayer.id, { opacity: Number(e.target.value) }) : updateTextLayer(selectedLayer.id, { opacity: Number(e.target.value) })}
-                      className="w-full accent-orange-500 h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                      className="w-full accent-orange-600 h-1 bg-stone-200 rounded-lg appearance-none cursor-pointer"
                     />
                  </div>
               </div>
               
               {/* Text Specific FX */}
               {selectedLayer.type === 'text' && (
-                <div className="pt-6 border-t border-white/5 space-y-4">
-                   <h3 className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">Advanced FX</h3>
+                <div className="pt-6 border-t border-stone-200 space-y-4">
+                   <h3 className="text-[10px] text-stone-500 uppercase font-bold tracking-wider">Advanced FX</h3>
                    <div>
-                      <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Text Stroke</label>
+                      <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Text Stroke</label>
                       <div className="flex gap-4">
                         <input 
                           type="color" value={(selectedLayer as TextLayer).strokeColor} 
@@ -1564,12 +1707,12 @@ export default function App() {
                         <input 
                           type="range" min="0" max="10" step="1" value={(selectedLayer as TextLayer).strokeWidth}
                           onChange={(e) => updateTextLayer(selectedLayer.id, { strokeWidth: Number(e.target.value) })}
-                          className="flex-1 accent-orange-500 h-1 mt-3.5 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                          className="flex-1 accent-orange-600 h-1 mt-3.5 bg-stone-200 rounded-lg appearance-none cursor-pointer"
                         />
                       </div>
                    </div>
                    <div>
-                      <label className="text-[10px] text-gray-500 uppercase font-bold mb-2 block">Drop Shadow</label>
+                      <label className="text-[10px] text-stone-500 uppercase font-bold mb-2 block">Drop Shadow</label>
                       <div className="grid grid-cols-2 gap-4">
                         <input 
                           type="color" value={(selectedLayer as TextLayer).shadowColor} 
@@ -1577,11 +1720,11 @@ export default function App() {
                           className="w-full h-8 bg-transparent border-none p-0 cursor-pointer"
                         />
                         <div className="flex items-center gap-2">
-                           <span className="text-[9px] text-gray-500">Blur:</span>
+                           <span className="text-[9px] text-stone-500 font-bold">Blur:</span>
                            <input 
                               type="number" value={(selectedLayer as TextLayer).shadowBlur}
                               onChange={(e) => updateTextLayer(selectedLayer.id, { shadowBlur: Number(e.target.value) })}
-                              className="w-full bg-white/5 border border-white/10 rounded px-1 text-[10px] text-white"
+                              className="w-full bg-white border border-stone-200 rounded px-1.5 py-0.5 text-[10px] text-stone-900 shadow-xs"
                            />
                         </div>
                       </div>
@@ -1591,7 +1734,7 @@ export default function App() {
 
               <button 
                 onClick={() => deleteLayer(selectedLayer.id)}
-                className="w-full py-3 mt-8 bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/20 rounded-xl text-[10px] uppercase font-bold transition-all"
+                className="w-full py-3 mt-8 bg-red-500/5 hover:bg-red-500/10 text-red-600 border border-red-500/20 rounded-xl text-[10px] uppercase font-bold transition-all shadow-xs hover:border-red-500/30"
               >
                 Permanently Delete Layer
               </button>
@@ -1599,8 +1742,8 @@ export default function App() {
           </div>
         ) : (
           <div className="flex-1 flex flex-col h-full overflow-hidden">
-            <div className="p-4 border-b border-white/10 flex items-center justify-between">
-              <h2 className="text-xs font-bold uppercase tracking-widest text-gray-500">Template Browser</h2>
+            <div className="p-4 border-b border-stone-200 flex items-center justify-between">
+              <h2 className="text-xs font-bold uppercase tracking-widest text-stone-500">Template Browser</h2>
               <div className="flex gap-2">
                  <button 
                   onClick={handleSaveTemplate} 
@@ -1618,7 +1761,7 @@ export default function App() {
                 </button>
                  <label 
                   title="Import Templates (JSON)"
-                  className="p-1.5 bg-white/5 rounded text-gray-400 hover:text-white cursor-pointer"
+                  className="p-1.5 bg-stone-200/50 hover:bg-stone-200 border border-stone-200 rounded text-stone-600 hover:text-stone-900 cursor-pointer"
                 >
                   <Upload className="w-3.5 h-3.5" />
                   <input type="file" accept=".json" className="hidden" onChange={handleImportTemplates} />
@@ -1628,9 +1771,9 @@ export default function App() {
             
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
                {templates.map((t) => (
-                 <div key={t.id} className="group p-4 bg-white/5 border border-white/5 rounded-2xl hover:border-orange-500/30 transition-all cursor-pointer">
+                 <div key={t.id} className="group p-4 bg-white border border-stone-200 rounded-2xl hover:border-orange-500/30 transition-all cursor-pointer shadow-xs">
                     <div className="flex items-center justify-between mb-3">
-                       <span className="text-xs font-medium text-white truncate pr-2">{t.name}</span>
+                       <span className="text-xs font-medium text-stone-900 font-semibold truncate pr-2">{t.name}</span>
                        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                           <button onClick={() => {
                             saveTemplates(templates.filter(item => item.id !== t.id));
@@ -1638,8 +1781,8 @@ export default function App() {
                        </div>
                     </div>
                     <div className="flex gap-2 mb-4">
-                       <div className="text-[9px] bg-white/5 px-2 py-0.5 rounded text-gray-500 uppercase font-bold">{(t.cardSize)}</div>
-                       <div className="text-[9px] bg-white/5 px-2 py-0.5 rounded text-gray-500 uppercase font-bold">{t.imageLayers.length + t.textLayers.length} LYRS</div>
+                       <div className="text-[9px] bg-stone-100 px-2 py-0.5 rounded text-stone-600 uppercase font-bold">{(t.cardSize)}</div>
+                       <div className="text-[9px] bg-stone-100 px-2 py-0.5 rounded text-stone-600 uppercase font-bold">{t.imageLayers.length + t.textLayers.length} LYRS</div>
                     </div>
                     <button 
                       onClick={() => {
@@ -1649,7 +1792,7 @@ export default function App() {
                         setTextLayers(t.textLayers);
                         setTemplateName(t.name);
                       }}
-                      className="w-full py-2 bg-orange-500/10 text-orange-500 rounded-lg text-[10px] font-bold uppercase transition-all hover:bg-orange-500 hover:text-white"
+                      className="w-full py-2 bg-orange-600/10 text-orange-700 hover:bg-orange-600 hover:text-white rounded-lg text-[10px] font-bold uppercase transition-all shadow-2xs"
                     >
                       Restore Design
                     </button>
@@ -1658,21 +1801,21 @@ export default function App() {
                
                {templates.length === 0 && (
                  <div className="flex flex-col items-center justify-center py-12 text-center">
-                    <div className="w-12 h-12 bg-white/5 rounded-full flex items-center justify-center mb-4">
-                       <Save className="w-5 h-5 text-gray-600" />
+                    <div className="w-12 h-12 bg-stone-200/50 rounded-full flex items-center justify-center mb-4">
+                       <Save className="w-5 h-5 text-stone-500" />
                     </div>
-                    <p className="text-xs text-gray-500 max-w-[160px]">No saved states found. Click the save icon to store your progress.</p>
+                    <p className="text-xs text-stone-550 max-w-[160px] font-medium leading-relaxed">No saved states found. Click the save icon to store your progress.</p>
                  </div>
                )}
             </div>
 
-            <div className="p-4 border-t border-white/10 bg-[#050505]">
-               <div className="text-[10px] text-gray-500 uppercase font-bold mb-4">Storage Metrics</div>
-               <div className="flex items-center justify-between text-[11px] mb-1">
+            <div className="p-4 border-t border-stone-200 bg-[#faf7f0]">
+               <div className="text-[10px] text-stone-500 uppercase font-bold mb-4">Storage Metrics</div>
+              <div className="flex items-center justify-between text-[11px] text-stone-600 mb-1 font-semibold">
                   <span>Persistence API</span>
-                  <span className="text-green-500">Browser/Local</span>
+                  <span className="text-emerald-700 font-bold">Browser/Local</span>
                </div>
-               <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
+               <div className="w-full h-1 bg-stone-200 rounded-full overflow-hidden">
                   <div className="h-full bg-orange-600 w-1/4" />
                </div>
             </div>
